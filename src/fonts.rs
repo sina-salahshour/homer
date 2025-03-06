@@ -1,4 +1,4 @@
-use std::cmp;
+use std::{cmp, fs};
 use std::{fs::File, io::Write};
 
 use anyhow::{Context, Ok, Result};
@@ -7,7 +7,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::env::Env;
+use crate::utils::CreateDirIfNotExists;
 use crate::utils::load_project_dirs;
+use inquire::MultiSelect;
+use zip_extract::extract;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FontInfo {
@@ -48,6 +52,7 @@ pub struct NerdFontsInfo {
 #[derive(Serialize, Deserialize)]
 pub struct FontDownloadStatus {
     pub downloaded: Vec<String>,
+    pub installed: Vec<String>,
 }
 
 impl FontDownloadStatus {
@@ -57,7 +62,10 @@ impl FontDownloadStatus {
         let font_zip_dir = data_dir.join("fonts");
         let font_status_path = font_zip_dir.join("font-status.json");
         if !font_status_path.exists() {
-            return Ok(FontDownloadStatus { downloaded: vec![] });
+            return Ok(FontDownloadStatus {
+                downloaded: vec![],
+                installed: vec![],
+            });
         }
         let font_status: FontDownloadStatus =
             serde_json::from_reader(File::open(font_status_path)?)?;
@@ -83,6 +91,15 @@ impl FontDownloadStatus {
     pub fn set_completed(&mut self, font: &str) -> Result<()> {
         if !self.downloaded.contains(&font.into()) {
             self.downloaded.push(font.into());
+        }
+
+        self.save()?;
+
+        Ok(())
+    }
+    pub fn set_installed(&mut self, font: &str) -> Result<()> {
+        if !self.installed.contains(&font.into()) {
+            self.installed.push(font.into());
         }
 
         self.save()?;
@@ -200,4 +217,74 @@ impl ToFontInfoVec for Vec<String> {
             .map(|item| item.clone())
             .collect()
     }
+}
+
+pub async fn install_font_tui() -> Result<()> {
+    let env = Env::prepare()?;
+    let mut font_status = FontDownloadStatus::load()?;
+
+    let dirs = load_project_dirs()?;
+    let font_dir = dirs_sys::home_dir()
+        .context("Couldn't get home directory")?
+        .join(".local")
+        .join("share")
+        .join("fonts")
+        .join(&env.font.fonts_dir_name);
+
+    font_dir.create_if_not_exists()?;
+
+    let nerd_fonts_current_version = env.font.fetch_root().await?.current_version;
+    let fonts = env.font.fetch_fonts().await?;
+
+    let installed_index = fonts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fontinfo)| {
+            match font_status.installed.contains(&fontinfo.folder_name) {
+                true => Some(index),
+                false => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::new();
+    let selected_fonts = MultiSelect::new("Select Fonts to install:", fonts.to_string_vec())
+        .with_vim_mode(true)
+        .with_default(&installed_index)
+        .prompt()?
+        .to_font_info_vec(&fonts);
+    let data_dir = dirs.data_dir();
+    let font_zip_dir = data_dir.join("fonts");
+
+    font_zip_dir.create_if_not_exists()?;
+
+    for font in selected_fonts.iter() {
+        if font_status.downloaded.contains(&font.folder_name) {
+            continue;
+        }
+        FontDownloader::download(
+            &client,
+            &font.folder_name,
+            &nerd_fonts_current_version,
+            font_zip_dir
+                .join(&font.folder_name)
+                .with_extension("zip")
+                .to_str()
+                .context(format!("Couldn't save font {}", font.folder_name))?,
+        )
+        .await?;
+        font_status.set_completed(&font.folder_name)?;
+    }
+
+    for font in selected_fonts.iter() {
+        if font_status.installed.contains(&font.folder_name) {
+            continue;
+        }
+        let zip_file_path = font_zip_dir.join(&font.folder_name).with_extension("zip");
+        let zip_file = fs::File::open(zip_file_path)?;
+        let font_extract_folder = font_dir.join(&font.folder_name);
+        font_extract_folder.create_if_not_exists()?;
+        extract(zip_file, &font_extract_folder, true)?;
+        font_status.set_installed(&font.folder_name)?;
+    }
+    Ok(())
 }
